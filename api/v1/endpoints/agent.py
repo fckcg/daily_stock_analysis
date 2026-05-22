@@ -6,15 +6,96 @@ Agent API endpoints.
 import asyncio
 import json
 import logging
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from src.auth import COOKIE_NAME
+from src import auth as _auth
 from src.config import get_config
 from src.services.agent_model_service import list_agent_model_deployments
+
+# ---------------------------------------------------------------------------
+# Chat session ownership policy
+# ---------------------------------------------------------------------------
+#
+# Bot-originated sessions follow the convention "<platform>_<user_id>:<...>"
+# (verified by tests/test_storage.py::test_get_chat_sessions_*). Web-admin
+# sessions are bare UUIDs without ``":"``. When admin auth is disabled
+# (the default single-user setup) we must NOT serve bot-prefixed sessions
+# to unauthenticated callers, otherwise anyone reachable on the network can
+# enumerate other users' chat history via /api/v1/agent/chat/sessions*
+# (CWE-639 / IDOR).
+#
+# ``user_id`` is therefore restricted to a conservative shape: starts with a
+# letter, alphanumerics + ``_`` / ``-`` only, no ``:`` / ``.`` / ``/``. This
+# also blocks path-traversal-ish probes and prevents collisions with the
+# internal ``":"`` segment separator.
+_USER_ID_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+
+def _validate_user_id(user_id: Optional[str]) -> Optional[str]:
+    """Return the validated user_id or raise 422 on a malformed value."""
+    if user_id is None or user_id == "":
+        return None
+    if not _USER_ID_PATTERN.match(user_id):
+        raise HTTPException(status_code=422, detail="invalid user_id")
+    return user_id
+
+
+def _is_admin_authenticated(request: Request) -> bool:
+    """Return True iff the caller presents a valid admin session cookie.
+
+    When admin auth is disabled, returns False – callers in that mode are
+    treated as anonymous local clients and only get access to web-local
+    (no-prefix) sessions.
+
+    Uses the ``src.auth`` module via attribute lookup (rather than binding
+    ``is_auth_enabled`` / ``verify_session`` at import time) so that test
+    suites can monkeypatch the module without re-importing this module.
+    """
+    if not _auth.is_auth_enabled():
+        return False
+    cookie_val = request.cookies.get(COOKIE_NAME)
+    return bool(cookie_val) and _auth.verify_session(cookie_val)
+
+
+def _session_id_is_bot_scoped(session_id: str) -> bool:
+    """Bot-originated sessions contain ``:`` (e.g. ``feishu_u1:chat``)."""
+    return ":" in (session_id or "")
+
+
+def _ensure_session_access(request: Request, session_id: str) -> None:
+    """Raise 404 when the caller is not allowed to touch ``session_id``.
+
+    Policy:
+      * Admin (auth enabled + valid cookie) -> full access.
+      * Anonymous caller (auth disabled) -> only sessions WITHOUT ``:`` are
+        accessible. Bot-prefixed sessions are reported as not found to avoid
+        leaking session existence (preferring 404 over 403).
+    """
+    if _is_admin_authenticated(request):
+        return
+    if _session_id_is_bot_scoped(session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+
+
+def _ensure_user_scope_access(request: Request, user_id: Optional[str]) -> None:
+    """Raise 404 when an anonymous caller tries to scope by a bot user_id.
+
+    A non-empty ``user_id`` always implies a bot prefix – web-admin sessions
+    are bare UUIDs and never carry a ``user_id`` query. Anonymous callers
+    must therefore not be able to enumerate prefixed sessions when admin
+    auth is off.
+    """
+    if user_id is None:
+        return
+    if not _is_admin_authenticated(request):
+        raise HTTPException(status_code=404, detail="session not found")
 
 # Tool name -> Chinese display name mapping
 TOOL_DISPLAY_NAMES: Dict[str, str] = {
@@ -205,7 +286,11 @@ class SessionMessagesResponse(BaseModel):
 
 
 @router.get("/chat/sessions", response_model=SessionsResponse)
-async def list_chat_sessions(limit: int = 50, user_id: Optional[str] = None):
+async def list_chat_sessions(
+    request: Request,
+    limit: int = 50,
+    user_id: Optional[str] = None,
+):
     """获取聊天会话列表
 
     Args:
@@ -214,29 +299,38 @@ async def list_chat_sessions(limit: int = 50, user_id: Optional[str] = None):
             isolation.  When provided, only sessions whose session_id
             starts with this prefix are returned.  The value must
             include the platform prefix, e.g. ``telegram_12345``,
-            ``feishu_ou_abc``.
+            ``feishu_ou_abc``.  When admin authentication is disabled,
+            this parameter is rejected to prevent unauthenticated
+            cross-user enumeration (CWE-639).
     """
     from src.storage import get_db
+    user_id = _validate_user_id(user_id)
+    _ensure_user_scope_access(request, user_id)
     sessions = get_db().get_chat_sessions(
         limit=limit,
         session_prefix=user_id,
         extra_session_ids=[user_id] if user_id else None,
     )
+    if user_id is None and not _is_admin_authenticated(request):
+        # Anonymous local mode: hide bot-prefixed sessions from listing.
+        sessions = [s for s in sessions if not _session_id_is_bot_scoped(s.get("session_id", ""))]
     return SessionsResponse(sessions=sessions)
 
 
 @router.get("/chat/sessions/{session_id}", response_model=SessionMessagesResponse)
-async def get_chat_session_messages(session_id: str, limit: int = 100):
+async def get_chat_session_messages(request: Request, session_id: str, limit: int = 100):
     """获取单个会话的完整消息"""
     from src.storage import get_db
+    _ensure_session_access(request, session_id)
     messages = get_db().get_conversation_messages(session_id, limit=limit)
     return SessionMessagesResponse(session_id=session_id, messages=messages)
 
 
 @router.delete("/chat/sessions/{session_id}")
-async def delete_chat_session(session_id: str):
+async def delete_chat_session(request: Request, session_id: str):
     """删除指定会话"""
     from src.storage import get_db
+    _ensure_session_access(request, session_id)
     count = get_db().delete_conversation_session(session_id)
     return {"deleted": count}
 
