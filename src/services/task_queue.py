@@ -304,6 +304,8 @@ class AnalysisTaskQueue:
         report_type: str = "detailed",
         force_refresh: bool = False,
         skills: Optional[List[str]] = None,
+        source_message: Optional[Any] = None,
+        query_source: str = "api",
     ) -> TaskInfo:
         """
         Submit a single analysis task.
@@ -315,6 +317,13 @@ class AnalysisTaskQueue:
             selection_source: Optional source label
             report_type: Report type
             force_refresh: Whether to bypass cache
+            skills: Analysis skill list to enable for this task
+            source_message: Optional message that triggered the task; forwarded
+                to the pipeline so bot integrations can push results back to
+                the originating chat. Type kept as ``Any`` to avoid
+                ``src.services`` depending on the ``bot`` package.
+            query_source: Source label written into analysis history meta
+                (api / bot / cli / system).
 
         Returns:
             TaskInfo: Accepted task information
@@ -334,6 +343,8 @@ class AnalysisTaskQueue:
             report_type=report_type,
             force_refresh=force_refresh,
             skills=skills,
+            source_message=source_message,
+            query_source=query_source,
         )
         if duplicates:
             raise duplicates[0]
@@ -349,6 +360,8 @@ class AnalysisTaskQueue:
         force_refresh: bool = False,
         notify: bool = True,
         skills: Optional[List[str]] = None,
+        source_message: Optional[Any] = None,
+        query_source: str = "api",
     ) -> Tuple[List[TaskInfo], List[DuplicateTaskError]]:
         """
         Submit analysis tasks in batch.
@@ -400,6 +413,8 @@ class AnalysisTaskQueue:
                         force_refresh,
                         notify,
                         task_skills,
+                        source_message=source_message,
+                        query_source=query_source,
                     )
                 except Exception:
                     # Roll back the current batch to avoid partial submission.
@@ -583,6 +598,8 @@ class AnalysisTaskQueue:
         force_refresh: bool,
         notify: bool = True,
         skills: Optional[List[str]] = None,
+        source_message: Optional[Any] = None,
+        query_source: str = "api",
     ) -> Optional[Dict[str, Any]]:
         """
         执行分析任务（在线程池中运行）
@@ -592,6 +609,10 @@ class AnalysisTaskQueue:
             stock_code: 股票代码
             report_type: 报告类型
             force_refresh: 是否强制刷新
+            notify: 是否触发通知推送
+            skills: 启用的分析 skill 列表
+            source_message: 原始触发消息（bot 路径用于把结果推回原会话）
+            query_source: 分析历史中记录的来源标签
             
         Returns:
             分析结果字典
@@ -626,6 +647,8 @@ class AnalysisTaskQueue:
                 send_notification=notify,
                 progress_callback=_on_progress,
                 skills=skills,
+                source_message=source_message,
+                query_source=query_source,
             )
             
             if result:

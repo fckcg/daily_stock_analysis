@@ -526,7 +526,13 @@ async def agent_chat_stream(request: ChatRequest):
             )
 
     async def event_generator():
-        # Start executor in a thread so we don't block the event loop
+        # NOTE (May 2026 audit Top 5): we deliberately use the default
+        # asyncio executor here rather than ``AnalysisTaskQueue``. Agent chat
+        # streaming is conversational LLM I/O, not stock analysis – it has
+        # no per-symbol dedupe, no SSE task event broadcast contract, and
+        # benefits from the larger default thread pool so chat doesn't
+        # contend with batch analysis workers. ``AnalysisTaskQueue`` stays
+        # the single owner of stock-analysis concurrency (bot + web).
         fut = loop.run_in_executor(None, run_sync)
         try:
             while True:
