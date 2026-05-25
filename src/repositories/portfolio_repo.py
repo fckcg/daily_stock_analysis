@@ -717,7 +717,13 @@ class PortfolioRepository:
         source: str = "manual",
         is_stale: bool = False,
     ) -> None:
-        with self.db.get_session() as session:
+        """Upsert an FX rate row.
+
+        Wrapped in ``_run_write_transaction`` so the existence check + write
+        share one ``BEGIN IMMEDIATE`` window with retry on lock contention.
+        """
+
+        def _write(session: Any) -> None:
             existing = session.execute(
                 select(PortfolioFxRate).where(
                     and_(
@@ -743,7 +749,11 @@ class PortfolioRepository:
                 existing.source = source
                 existing.is_stale = is_stale
                 existing.updated_at = datetime.now()
-            session.commit()
+
+        self.db._run_write_transaction(
+            f"portfolio.save_fx_rate[{from_currency}->{to_currency}@{rate_date}]",
+            _write,
+        )
 
     def get_latest_fx_rate(
         self,
@@ -809,7 +819,14 @@ class PortfolioRepository:
         lots: Iterable[Dict[str, Any]],
         valuation_currency: str,
     ) -> None:
-        with self.db.get_session() as session:
+        """Replace position & lot caches in one ``BEGIN IMMEDIATE`` window."""
+        # Materialize iterables before passing into the retryable write_operation:
+        # the operation may execute more than once on lock contention, and a
+        # generator can only be iterated once.
+        positions_list = list(positions)
+        lots_list = list(lots)
+
+        def _write(session: Any) -> None:
             session.execute(
                 delete(PortfolioPosition).where(
                     and_(
@@ -827,7 +844,7 @@ class PortfolioRepository:
                 )
             )
 
-            for item in positions:
+            for item in positions_list:
                 session.add(
                     PortfolioPosition(
                         account_id=account_id,
@@ -845,7 +862,7 @@ class PortfolioRepository:
                     )
                 )
 
-            for lot in lots:
+            for lot in lots_list:
                 session.add(
                     PortfolioPositionLot(
                         account_id=account_id,
@@ -860,7 +877,10 @@ class PortfolioRepository:
                     )
                 )
 
-            session.commit()
+        self.db._run_write_transaction(
+            f"portfolio.replace_positions_and_lots[account_id={account_id}]",
+            _write,
+        )
 
     def _invalidate_account_cache_in_session(self, *, session: Any, account_id: int, from_date: date) -> None:
         session.execute(
@@ -880,15 +900,13 @@ class PortfolioRepository:
 
     @staticmethod
     def _is_sqlite_locked_error(exc: OperationalError) -> bool:
-        err_text = str(getattr(exc, "orig", exc)).lower()
-        return any(
-            token in err_text
-            for token in (
-                "database is locked",
-                "database schema is locked",
-                "database table is locked",
-            )
-        )
+        """Delegate to ``DatabaseManager`` so we keep one source of truth.
+
+        Kept as a staticmethod for backward compat with callers that have
+        the repo instance handy (``self._is_sqlite_locked_error``); previously
+        this was a separate copy-paste implementation – now it forwards.
+        """
+        return DatabaseManager._is_sqlite_locked_error(exc)
 
     @staticmethod
     def _translate_trade_integrity_error(
@@ -930,7 +948,9 @@ class PortfolioRepository:
         fx_stale: bool,
         payload: str,
     ) -> None:
-        with self.db.get_session() as session:
+        """Upsert a daily snapshot row under one ``BEGIN IMMEDIATE`` window."""
+
+        def _write(session: Any) -> None:
             existing = session.execute(
                 select(PortfolioDailySnapshot).where(
                     and_(
@@ -971,7 +991,11 @@ class PortfolioRepository:
                 existing.fx_stale = fx_stale
                 existing.payload = payload
                 existing.updated_at = datetime.now()
-            session.commit()
+
+        self.db._run_write_transaction(
+            f"portfolio.upsert_daily_snapshot[account_id={account_id},date={snapshot_date}]",
+            _write,
+        )
 
     def replace_positions_lots_and_snapshot(
         self,
@@ -994,7 +1018,12 @@ class PortfolioRepository:
         valuation_currency: str,
     ) -> None:
         """Atomically refresh position cache and daily snapshot in one transaction."""
-        with self.db.get_session() as session:
+        # Materialize iterables before the retryable write_operation; see
+        # ``replace_positions_and_lots`` for the same rationale.
+        positions_list = list(positions)
+        lots_list = list(lots)
+
+        def _write(session: Any) -> None:
             session.execute(
                 delete(PortfolioPosition).where(
                     and_(
@@ -1012,7 +1041,7 @@ class PortfolioRepository:
                 )
             )
 
-            for item in positions:
+            for item in positions_list:
                 session.add(
                     PortfolioPosition(
                         account_id=account_id,
@@ -1030,7 +1059,7 @@ class PortfolioRepository:
                     )
                 )
 
-            for lot in lots:
+            for lot in lots_list:
                 session.add(
                     PortfolioPositionLot(
                         account_id=account_id,
@@ -1086,4 +1115,7 @@ class PortfolioRepository:
                 existing.payload = payload
                 existing.updated_at = datetime.now()
 
-            session.commit()
+        self.db._run_write_transaction(
+            f"portfolio.replace_positions_lots_and_snapshot[account_id={account_id},date={snapshot_date}]",
+            _write,
+        )

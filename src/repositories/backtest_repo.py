@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import date, datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from sqlalchemy import and_, delete, desc, func, or_, select
 
@@ -205,8 +205,14 @@ class BacktestRepository:
             return list(rows)
 
     def upsert_summary(self, summary: BacktestSummary) -> None:
-        """Insert or replace summary row by unique key."""
-        with self.db.get_session() as session:
+        """Insert or replace summary row by unique key.
+
+        Wrapped in ``_run_write_transaction`` so the existence check and
+        the subsequent insert/update share one ``BEGIN IMMEDIATE`` lock with
+        retry on transient SQLite contention.
+        """
+
+        def _write(session: Any) -> None:
             existing = session.execute(
                 select(BacktestSummary)
                 .where(
@@ -244,11 +250,14 @@ class BacktestRepository:
                     "diagnostics_json",
                 ):
                     setattr(existing, attr, getattr(summary, attr))
-                session.commit()
                 return
 
             session.add(summary)
-            session.commit()
+
+        self.db._run_write_transaction(
+            f"backtest.upsert_summary[scope={summary.scope},code={summary.code}]",
+            _write,
+        )
 
     def get_summary(
         self,

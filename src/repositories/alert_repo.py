@@ -125,6 +125,12 @@ class AlertRepository:
         Callers must use this only after they have decided the trigger is safe to
         deduplicate. Non-triggered or timestamp-less history should use
         ``create_trigger`` so audit rows are not silently reclassified as deduped.
+
+        Wrapped in ``DatabaseManager._run_write_transaction`` so the existence
+        probe and the insert share a single ``BEGIN IMMEDIATE`` window – without
+        it, two concurrent writers can both observe "no existing row" and then
+        race to insert duplicates (or one trips ``database is locked`` and is
+        not retried).
         """
         self._validate_trigger_fields(fields)
 
@@ -135,14 +141,16 @@ class AlertRepository:
                 "create_trigger_if_absent requires triggered status, rule_id, and data_timestamp"
             )
 
-        with self.db.get_session() as session:
+        target = fields.get("target")
+        data_source = fields.get("data_source")
+
+        def _write(session: Any) -> Tuple[AlertTriggerRecord, bool]:
             query = select(AlertTriggerRecord).where(
                 AlertTriggerRecord.rule_id == rule_id,
-                AlertTriggerRecord.target == fields.get("target"),
+                AlertTriggerRecord.target == target,
                 AlertTriggerRecord.status == "triggered",
                 AlertTriggerRecord.data_timestamp == data_timestamp,
             )
-            data_source = fields.get("data_source")
             if data_source is None:
                 query = query.where(AlertTriggerRecord.data_source.is_(None))
             else:
@@ -152,13 +160,23 @@ class AlertRepository:
                 query.order_by(AlertTriggerRecord.id.asc()).limit(1)
             ).scalar_one_or_none()
             if existing is not None:
+                # Detach so callers can read attributes after _run_write_transaction
+                # commits + closes the session.
+                session.refresh(existing)
+                session.expunge(existing)
                 return existing, False
 
             row = AlertTriggerRecord(**fields)
             session.add(row)
-            session.commit()
+            session.flush()
             session.refresh(row)
+            session.expunge(row)
             return row, True
+
+        return self.db._run_write_transaction(
+            f"alert.create_trigger_if_absent[rule_id={rule_id}]",
+            _write,
+        )
 
     @staticmethod
     def _validate_trigger_fields(fields: Dict[str, Any]) -> None:
@@ -213,7 +231,14 @@ class AlertRepository:
         reason: Optional[str] = None,
         state: str = "active",
     ) -> AlertCooldownRecord:
-        with self.db.get_session() as session:
+        """Upsert cooldown row.
+
+        Wrapped in ``_run_write_transaction`` so the read-modify-write block
+        runs under one ``BEGIN IMMEDIATE`` lock with retry on transient SQLite
+        contention.
+        """
+
+        def _write(session: Any) -> AlertCooldownRecord:
             row = session.execute(
                 select(AlertCooldownRecord)
                 .where(
@@ -237,9 +262,17 @@ class AlertRepository:
             row.reason = reason
             row.state = state
             row.updated_at = datetime.now()
-            session.commit()
+            session.flush()
+            # Detach so callers can read attributes after _run_write_transaction
+            # commits + closes the session.
             session.refresh(row)
+            session.expunge(row)
             return row
+
+        return self.db._run_write_transaction(
+            f"alert.upsert_cooldown[rule_id={rule_id}]",
+            _write,
+        )
 
     def get_rule_cooldown_summary(
         self,
