@@ -47,6 +47,8 @@ class AnalysisService:
         send_notification: bool = True,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         skills: Optional[List[str]] = None,
+        source_message: Optional[Any] = None,
+        query_source: str = "api",
     ) -> Optional[Dict[str, Any]]:
         """
         执行股票分析
@@ -57,7 +59,12 @@ class AnalysisService:
             force_refresh: 是否强制刷新
             query_id: 查询 ID（可选）
             send_notification: 是否发送通知（API 触发默认发送）
-            
+            progress_callback: 进度回调
+            skills: 启用的分析 skill 列表
+            source_message: 触发分析的原始消息（用于 bot 单股推送回原会话）；
+                类型保持松散（``Any``）以避免 ``src.services`` 反向依赖 ``bot`` 包。
+            query_source: 任务来源标识（api/bot/cli/system 等），写入分析历史的元数据。
+        
         Returns:
             分析结果字典，包含:
             - stock_code: 股票代码
@@ -82,9 +89,10 @@ class AnalysisService:
             pipeline = StockAnalysisPipeline(
                 config=config,
                 query_id=query_id,
-                query_source="api",
+                query_source=query_source,
                 progress_callback=progress_callback,
                 analysis_skills=skills,
+                source_message=source_message,
             )
             
             # 确定报告类型 (API: simple/detailed/full/brief -> ReportType)
