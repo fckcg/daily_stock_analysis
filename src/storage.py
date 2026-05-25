@@ -803,6 +803,13 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             # 创建所有表
             Base.metadata.create_all(self._engine)
 
+            # 应用 Alembic 迁移：
+            # - 全新部署：``create_all`` 已建表，stamp 到 head 后无 pending
+            # - 老部署（无 alembic_version 表）：自动 stamp 到 baseline，然后
+            #   应用从 baseline 之后的所有迁移
+            # 详细说明见 alembic/README.md。
+            self._apply_alembic_migrations()
+
             self._initialized = True
             logger.info(f"数据库初始化完成: {db_url}")
 
@@ -854,6 +861,80 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 logger.debug("数据库引擎已清理")
         except Exception as e:
             logger.warning(f"清理数据库引擎时出错: {e}")
+
+    def _apply_alembic_migrations(self) -> None:
+        """
+        Run ``alembic upgrade head`` against the open engine.
+
+        Two cases:
+
+        * **Empty / fresh DB**: ``create_all`` already produced every table
+          but ``alembic_version`` is missing. We stamp the baseline (``0001``)
+          first, then ``upgrade head``.
+        * **Tracked DB**: ``alembic_version`` exists; the upgrade applies any
+          revision newer than the stamped one.
+
+        Failures are logged and re-raised – an out-of-date schema is unsafe
+        to silently ignore. Set ``DSA_DISABLE_DB_MIGRATIONS=1`` to opt out
+        for emergency triage.
+
+        Refs: May 2026 audit Top 2 (no DB migration mechanism).
+        """
+        import os
+
+        if os.environ.get("DSA_DISABLE_DB_MIGRATIONS", "").lower() in ("1", "true", "yes"):
+            logger.warning(
+                "Alembic 迁移已被 DSA_DISABLE_DB_MIGRATIONS 关闭；"
+                "schema 漂移风险由调用方承担"
+            )
+            return
+
+        try:
+            from alembic import command
+            from alembic.config import Config as AlembicConfig
+            from alembic.runtime.migration import MigrationContext
+            from alembic.script import ScriptDirectory
+        except ImportError as exc:  # pragma: no cover - alembic is in requirements
+            logger.warning(
+                "alembic 未安装，跳过迁移；请确认 requirements.txt 已包含 ``alembic`` "
+                "(import error: %s)",
+                exc,
+            )
+            return
+
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        ini_path = os.path.join(project_root, "alembic.ini")
+        if not os.path.exists(ini_path):
+            logger.warning("未找到 alembic.ini (%s)，跳过迁移", ini_path)
+            return
+
+        alembic_cfg = AlembicConfig(ini_path)
+        # 把当前 engine 注入 alembic env.py，让迁移复用 SQLite WAL/busy_timeout
+        # 等运行时设置，而不是新建一个独立连接。
+        # 用 ``begin()`` 而不是 ``connect()`` 让 stamp/upgrade 的 DDL/DML 在
+        # with 块结束时自动 commit；否则 SQLite 上 alembic_version 写入会被
+        # 静默回滚。
+        with self._engine.begin() as connection:
+            alembic_cfg.attributes["connection"] = connection
+
+            mig_ctx = MigrationContext.configure(connection)
+            current_rev = mig_ctx.get_current_revision()
+
+            script = ScriptDirectory.from_config(alembic_cfg)
+            target_rev = script.get_current_head()
+
+            if current_rev is None and target_rev is not None:
+                # 老部署没有 alembic_version 表 —— 我们刚通过 ``create_all`` 建好
+                # 表，但 schema 形态等价于 baseline (``0001``)，所以 stamp 之后
+                # 再 upgrade，不会重复执行 baseline 的 DDL。
+                logger.info("[Alembic] 现有库未受 alembic 管理，stamp baseline 并升级到 %s", target_rev)
+                command.stamp(alembic_cfg, "0001")
+
+            if target_rev is not None and current_rev != target_rev:
+                logger.info("[Alembic] 升级数据库 schema: %s -> %s", current_rev, target_rev)
+                command.upgrade(alembic_cfg, "head")
+            else:
+                logger.debug("[Alembic] schema 已是最新 (%s)", current_rev)
 
     def _install_sqlite_pragma_handler(self) -> None:
         """为 SQLite 连接安装竞争保护参数。"""
