@@ -6,6 +6,7 @@
 python-dotenv>=1.0.0        # 环境变量配置管理
 tenacity>=8.2.0             # 重试机制（指数退避）
 sqlalchemy>=2.0.0           # ORM数据库操作
+alembic>=1.13.0             # SQLAlchemy 迁移工具（schema 演进 / Issue #Top2）
 schedule>=1.2.0             # 定时任务调度
 exchange-calendars>=4.5.0   # 交易日历（A股/港股/美股，Issue #373）
 
